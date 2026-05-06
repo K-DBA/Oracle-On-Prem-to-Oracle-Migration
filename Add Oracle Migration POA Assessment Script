@@ -1,0 +1,716 @@
+ cat migration1.sh
+#!/bin/bash
+
+################################################################################
+# Oracle DBA Migration POA Assessment Script
+# Version : Stable Enterprise Edition
+################################################################################
+
+# ------------------------------------------------------------------------------
+# SAFE MODE
+# ------------------------------------------------------------------------------
+
+set -uo pipefail
+
+# ------------------------------------------------------------------------------
+# REPORT DIRECTORY
+# ------------------------------------------------------------------------------
+
+REPORT_DIR="$(pwd)/poa_reports_$(date +%Y%m%d_%H%M%S)"
+REPORT="${REPORT_DIR}/oracle_migration_poa.html"
+LOG="${REPORT_DIR}/collection.log"
+
+mkdir -p "$REPORT_DIR"
+
+exec > >(tee -a "$LOG") 2>&1
+
+echo "========================================================"
+echo " Oracle Migration POA Assessment"
+echo " Started : $(date)"
+echo "========================================================"
+
+# ------------------------------------------------------------------------------
+# ORACLE ENVIRONMENT
+# ------------------------------------------------------------------------------
+
+export ORACLE_SID=${ORACLE_SID:-DEVDB}
+
+ORACLE_HOME_FROM_TAB=$(grep "^${ORACLE_SID}:" /etc/oratab 2>/dev/null | awk -F: '{print $2}')
+
+export ORACLE_HOME=${ORACLE_HOME_FROM_TAB:-${ORACLE_HOME:-""}}
+
+export PATH=$ORACLE_HOME/bin:$PATH
+
+DATE=$(date "+%d-%b-%Y %H:%M:%S")
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+IP=$(hostname -I | awk '{print $1}')
+
+# ------------------------------------------------------------------------------
+# SQL FUNCTIONS
+# ------------------------------------------------------------------------------
+
+run_sql() {
+
+sqlplus -s "/ as sysdba" <<EOF
+set pagesize 500
+set linesize 300
+set feedback off
+set heading on
+set trimspool on
+set wrap off
+
+$1
+
+exit;
+EOF
+
+}
+
+run_sql_raw() {
+
+sqlplus -s "/ as sysdba" <<EOF
+set pagesize 0
+set feedback off
+set heading off
+set verify off
+
+$1
+
+exit;
+EOF
+
+}
+
+# ------------------------------------------------------------------------------
+# DATABASE INFO
+# ------------------------------------------------------------------------------
+
+echo "[1] Database Identity"
+
+DB_NAME=$(run_sql_raw "select name from v\$database;" | xargs)
+
+DB_ROLE=$(run_sql_raw "select database_role from v\$database;" | xargs)
+
+OPEN_MODE=$(run_sql_raw "select open_mode from v\$database;" | xargs)
+
+LOG_MODE=$(run_sql_raw "select log_mode from v\$database;" | xargs)
+
+DB_VERSION=$(run_sql_raw "select version from v\$instance;" | xargs)
+
+DB_SIZE_GB=$(run_sql_raw "
+select round(sum(bytes)/1024/1024/1024,2)
+from dba_data_files;
+" | xargs)
+
+CHARSET=$(run_sql_raw "
+select value
+from nls_database_parameters
+where parameter='NLS_CHARACTERSET';
+" | xargs)
+
+INSTANCE_INFO=$(run_sql "
+select instance_name,
+host_name,
+version,
+status
+from v\$instance;
+")
+
+DATABASE_INFO=$(run_sql "
+select name,
+open_mode,
+database_role,
+log_mode
+from v\$database;
+")
+
+# ------------------------------------------------------------------------------
+# TABLESPACE INFO
+# ------------------------------------------------------------------------------
+
+echo "[2] Tablespace Information"
+
+TABLESPACE_INFO=$(run_sql "
+select tablespace_name,
+round(sum(bytes)/1024/1024,2) MB
+from dba_data_files
+group by tablespace_name
+order by 2 desc;
+")
+
+# ------------------------------------------------------------------------------
+# INVALID OBJECTS
+# ------------------------------------------------------------------------------
+
+echo "[3] Invalid Objects"
+
+INVALID_OBJECTS=$(run_sql "
+select owner,
+object_type,
+count(*) count
+from dba_objects
+where status='INVALID'
+group by owner, object_type;
+")
+
+INVALID_COUNT=$(run_sql_raw "
+select count(*)
+from dba_objects
+where status='INVALID';
+" | xargs)
+
+# ------------------------------------------------------------------------------
+# DATABASE COMPONENTS
+# ------------------------------------------------------------------------------
+
+echo "[4] Database Components"
+
+DB_COMPONENTS=$(run_sql "
+select comp_name,
+version,
+status
+from dba_registry;
+")
+
+# ------------------------------------------------------------------------------
+# DATAFILES
+# ------------------------------------------------------------------------------
+
+echo "[5] Datafiles"
+
+DATAFILES=$(run_sql "
+select file_name,
+tablespace_name,
+round(bytes/1024/1024,2) MB
+from dba_data_files;
+")
+
+# ------------------------------------------------------------------------------
+# REDO LOGS
+# ------------------------------------------------------------------------------
+
+echo "[6] Redologs"
+
+REDOLOGS=$(run_sql "
+select group#,
+thread#,
+bytes/1024/1024 MB,
+status
+from v\$log;
+")
+
+# ------------------------------------------------------------------------------
+# RMAN
+# ------------------------------------------------------------------------------
+
+echo "[7] RMAN Backup Info"
+
+RMAN_SUMMARY=$(rman target / <<EOF 2>/dev/null || true
+list backup summary;
+exit;
+EOF
+)
+
+RMAN_CONFIG=$(rman target / <<EOF 2>/dev/null || true
+show all;
+exit;
+EOF
+)
+
+# ------------------------------------------------------------------------------
+# LISTENER
+# ------------------------------------------------------------------------------
+
+echo "[8] Listener Status"
+
+LISTENER_STATUS=$(lsnrctl status 2>/dev/null || echo "Listener check failed")
+
+# ------------------------------------------------------------------------------
+# PATCH INFO
+# ------------------------------------------------------------------------------
+
+echo "[9] Oracle Patch Info"
+
+PATCH_INFO=$($ORACLE_HOME/OPatch/opatch lspatches 2>/dev/null || echo "Patch info unavailable")
+
+# ------------------------------------------------------------------------------
+# SCHEDULER JOBS
+# ------------------------------------------------------------------------------
+
+echo "[10] Scheduler Jobs"
+
+SCHEDULER_JOBS=$(run_sql "
+select owner,
+job_name,
+enabled,
+state
+from dba_scheduler_jobs;
+")
+
+# ------------------------------------------------------------------------------
+# DB LINKS
+# ------------------------------------------------------------------------------
+
+echo "[11] DB Links"
+
+DB_LINKS=$(run_sql "
+select owner,
+db_link,
+host
+from dba_db_links;
+")
+
+# ------------------------------------------------------------------------------
+# ACTIVE SESSIONS
+# ------------------------------------------------------------------------------
+
+echo "[12] Active Sessions"
+
+ACTIVE_SESSIONS=$(run_sql "
+select sid,
+serial#,
+username,
+status,
+program
+from v\$session
+where username is not null;
+")
+
+# ------------------------------------------------------------------------------
+# DATAGUARD
+# ------------------------------------------------------------------------------
+
+echo "[13] Data Guard"
+
+DG_STATUS=$(run_sql "
+select database_role,
+protection_mode,
+protection_level,
+switchover_status
+from v\$database;
+")
+
+# ------------------------------------------------------------------------------
+# ASM
+# ------------------------------------------------------------------------------
+
+echo "[14] ASM Validation"
+
+ASM_CHECK=$(ps -ef | grep asm_pmon | grep -v grep || true)
+
+if [ -n "$ASM_CHECK" ]; then
+
+ASM_STATUS="ASM CONFIGURED"
+
+ASM_DISKGROUPS=$(run_sql "
+select name,
+state,
+type,
+total_mb,
+free_mb
+from v\$asm_diskgroup;
+")
+
+else
+
+ASM_STATUS="NO ASM CONFIGURED"
+
+ASM_DISKGROUPS="Filesystem based database"
+
+fi
+
+# ------------------------------------------------------------------------------
+# OS INFO
+# ------------------------------------------------------------------------------
+
+echo "[15] OS Information"
+
+CPU_INFO=$(lscpu)
+
+MEMORY_INFO=$(free -g)
+
+DISK_INFO=$(df -h)
+
+LSBLK_INFO=$(lsblk)
+
+HUGEPAGES=$(grep Huge /proc/meminfo)
+
+KERNEL_INFO=$(uname -a)
+
+UPTIME_INFO=$(uptime)
+
+# ------------------------------------------------------------------------------
+# COLORS
+# ------------------------------------------------------------------------------
+
+if [ "${INVALID_COUNT:-0}" -gt 0 ]; then
+INVALID_COLOR="#dc3545"
+else
+INVALID_COLOR="#28a745"
+fi
+
+if [[ "$LOG_MODE" == "ARCHIVELOG" ]]; then
+LOGMODE_COLOR="#28a745"
+LOGMODE_BADGE="badge-success"
+else
+LOGMODE_COLOR="#dc3545"
+LOGMODE_BADGE="badge-danger"
+fi
+
+# ------------------------------------------------------------------------------
+# HTML REPORT
+# ------------------------------------------------------------------------------
+
+echo ""
+echo "Generating HTML report..."
+
+cat > "$REPORT" <<EOF
+
+<html>
+
+<head>
+
+<title>Oracle Migration POA Report</title>
+
+<style>
+
+body {
+font-family: Arial;
+background: #f4f4f4;
+margin: 20px;
+}
+
+h1 {
+color: #003366;
+}
+
+h2 {
+background: #003366;
+color: white;
+padding: 10px;
+}
+
+.section {
+background: white;
+padding: 15px;
+margin-bottom: 20px;
+border-radius: 5px;
+box-shadow: 0px 0px 5px gray;
+}
+
+pre {
+background: #f8f8f8;
+padding: 10px;
+overflow-x: auto;
+border: 1px solid #ccc;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>Oracle Migration Assessment Report</h1>
+
+<div class="section">
+
+<h2>General Information</h2>
+
+<pre>
+Generated Date : $DATE
+Hostname       : $HOSTNAME
+IP Address     : $IP
+Oracle SID     : $ORACLE_SID
+Oracle Home    : $ORACLE_HOME
+Database Name  : $DB_NAME
+Oracle Version : $DB_VERSION
+Database Role  : $DB_ROLE
+Open Mode      : $OPEN_MODE
+Log Mode       : $LOG_MODE
+Character Set  : $CHARSET
+Database Size  : $DB_SIZE_GB GB
+ASM Status     : $ASM_STATUS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Database Information</h2>
+
+<pre>
+$DATABASE_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Instance Information</h2>
+
+<pre>
+$INSTANCE_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Tablespace Usage</h2>
+
+<pre>
+$TABLESPACE_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Invalid Objects</h2>
+
+<pre>
+$INVALID_OBJECTS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Database Components</h2>
+
+<pre>
+$DB_COMPONENTS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Datafiles</h2>
+
+<pre>
+$DATAFILES
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Redo Logs</h2>
+
+<pre>
+$REDOLOGS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>RMAN Backup Summary</h2>
+
+<pre>
+$RMAN_SUMMARY
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>RMAN Configuration</h2>
+
+<pre>
+$RMAN_CONFIG
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Listener Status</h2>
+
+<pre>
+$LISTENER_STATUS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Patch Information</h2>
+
+<pre>
+$PATCH_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Scheduler Jobs</h2>
+
+<pre>
+$SCHEDULER_JOBS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Database Links</h2>
+
+<pre>
+$DB_LINKS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Active Sessions</h2>
+
+<pre>
+$ACTIVE_SESSIONS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Data Guard Status</h2>
+
+<pre>
+$DG_STATUS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>ASM Information</h2>
+
+<pre>
+$ASM_DISKGROUPS
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>CPU Information</h2>
+
+<pre>
+$CPU_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Memory Information</h2>
+
+<pre>
+$MEMORY_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Disk Usage</h2>
+
+<pre>
+$DISK_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Block Devices</h2>
+
+<pre>
+$LSBLK_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>HugePages</h2>
+
+<pre>
+$HUGEPAGES
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Kernel Information</h2>
+
+<pre>
+$KERNEL_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>System Uptime</h2>
+
+<pre>
+$UPTIME_INFO
+</pre>
+
+</div>
+
+<div class="section">
+
+<h2>Migration Recommendation</h2>
+
+<pre>
+
+Recommended Method:
+RMAN Backup & Restore
+
+Reason:
+- Same Oracle Version
+- ARCHIVELOG Enabled
+- Single Instance Database
+- Easy Rollback
+- Low Complexity
+
+Estimated Downtime:
+1 to 2 Hours
+
+</pre>
+
+</div>
+
+</body>
+
+</html>
+
+EOF
+
+# ------------------------------------------------------------------------------
+# FINAL OUTPUT
+# ------------------------------------------------------------------------------
+
+echo ""
+echo "========================================================"
+echo " Oracle Migration POA Completed"
+echo "========================================================"
+echo ""
+echo "HTML Report:"
+echo "$REPORT"
+echo ""
+echo "LOG File:"
+echo "$LOG"
+echo ""
+echo "Open report:"
+echo ""
+echo "firefox $REPORT &"
+echo ""
+echo "========================================================"
