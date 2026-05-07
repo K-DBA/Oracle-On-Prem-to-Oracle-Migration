@@ -1,0 +1,559 @@
+#!/bin/bash
+
+################################################################################
+# Oracle DBA Migration POA Assessment Script
+# Version : Enterprise Edition (Enhanced)
+################################################################################
+
+# ------------------------------------------------------------------------------
+# SAFE MODE
+# ------------------------------------------------------------------------------
+set -uo pipefail
+
+# ------------------------------------------------------------------------------
+# REPORT DIRECTORY
+# ------------------------------------------------------------------------------
+REPORT_DIR="$(pwd)/poa_reports_$(date +%Y%m%d_%H%M%S)"
+REPORT="${REPORT_DIR}/oracle_migration_poa.html"
+LOG="${REPORT_DIR}/collection.log"
+
+mkdir -p "$REPORT_DIR"
+
+exec > >(tee -a "$LOG") 2>&1
+
+echo "========================================================"
+echo " Oracle Migration POA Assessment"
+echo " Started : $(date)"
+echo "========================================================"
+
+# ------------------------------------------------------------------------------
+# ORACLE ENVIRONMENT
+# ------------------------------------------------------------------------------
+export ORACLE_SID=${ORACLE_SID:-DEVDB}
+
+ORACLE_HOME_FROM_TAB=$(grep "^${ORACLE_SID}:" /etc/oratab 2>/dev/null | awk -F: '{print $2}')
+export ORACLE_HOME=${ORACLE_HOME_FROM_TAB:-${ORACLE_HOME:-""}}
+export PATH=$ORACLE_HOME/bin:$PATH
+
+DATE=$(date "+%d-%b-%Y %H:%M:%S")
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+IP=$(hostname -I | awk '{print $1}')
+
+# ------------------------------------------------------------------------------
+# SQL FUNCTIONS
+# ------------------------------------------------------------------------------
+run_sql() {
+sqlplus -s "/ as sysdba" <<EOF
+set pagesize 500
+set linesize 300
+set feedback off
+set heading on
+set trimspool on
+set wrap off
+ $1
+exit;
+EOF
+}
+
+run_sql_raw() {
+sqlplus -s "/ as sysdba" <<EOF
+set pagesize 0
+set feedback off
+set heading off
+set verify off
+ $1
+exit;
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# ORIGINAL DATABASE INFO
+# ------------------------------------------------------------------------------
+echo "[1] Database Identity"
+
+DB_NAME=$(run_sql_raw "select name from v\$database;" | xargs)
+DB_ROLE=$(run_sql_raw "select database_role from v\$database;" | xargs)
+OPEN_MODE=$(run_sql_raw "select open_mode from v\$database;" | xargs)
+LOG_MODE=$(run_sql_raw "select log_mode from v\$database;" | xargs)
+DB_VERSION=$(run_sql_raw "select version from v\$instance;" | xargs)
+DB_SIZE_GB=$(run_sql_raw "select round(sum(bytes)/1024/1024/1024,2) from dba_data_files;" | xargs)
+CHARSET=$(run_sql_raw "select value from nls_database_parameters where parameter='NLS_CHARACTERSET';" | xargs)
+
+INSTANCE_INFO=$(run_sql "select instance_name, host_name, version, status from v\$instance;")
+DATABASE_INFO=$(run_sql "select name, open_mode, database_role, log_mode from v\$database;")
+
+# ------------------------------------------------------------------------------
+# ORIGINAL TABLESPACE INFO (Allocated)
+# ------------------------------------------------------------------------------
+echo "[2] Tablespace Information (Allocated)"
+TABLESPACE_INFO=$(run_sql "
+select tablespace_name, round(sum(bytes)/1024/1024,2) MB
+from dba_data_files group by tablespace_name order by 2 desc;
+")
+
+# ------------------------------------------------------------------------------
+# NEW: TABLESPACE ACTUAL USAGE (Used vs Free)
+# ------------------------------------------------------------------------------
+echo "[3] Tablespace Actual Usage (Used vs Free)"
+TABLESPACE_USAGE=$(run_sql "
+SELECT df.tablespace_name,
+       ROUND(df.bytes/1024/1024/1024, 2) AS allocated_gb,
+       ROUND(NVL(fs.bytes, 0)/1024/1024/1024, 2) AS free_gb,
+       ROUND((df.bytes - NVL(fs.bytes, 0))/1024/1024/1024, 2) AS used_gb
+FROM dba_data_files df
+LEFT JOIN (SELECT tablespace_name, SUM(bytes) bytes FROM dba_free_space GROUP BY tablespace_name) fs
+ON df.tablespace_name = fs.tablespace_name
+GROUP BY df.tablespace_name, df.bytes, fs.bytes
+ORDER BY (df.bytes - NVL(fs.bytes, 0)) DESC;
+")
+
+# ------------------------------------------------------------------------------
+# NEW: TOP SCHEMA SIZES
+# ------------------------------------------------------------------------------
+echo "[4] Top Schema Sizes"
+SCHEMA_SIZES=$(run_sql "
+SELECT owner, ROUND(SUM(bytes)/1024/1024/1024, 2) AS size_gb
+FROM dba_segments
+GROUP BY owner
+HAVING SUM(bytes)/1024/1024/1024 > 0.1
+ORDER BY size_gb DESC;
+")
+
+# ------------------------------------------------------------------------------
+# INVALID OBJECTS
+# ------------------------------------------------------------------------------
+echo "[5] Invalid Objects"
+INVALID_OBJECTS=$(run_sql "
+select owner, object_type, count(*) count
+from dba_objects where status='INVALID' group by owner, object_type;
+")
+INVALID_COUNT=$(run_sql_raw "select count(*) from dba_objects where status='INVALID';" | xargs)
+
+# ------------------------------------------------------------------------------
+# DATABASE COMPONENTS
+# ------------------------------------------------------------------------------
+echo "[6] Database Components"
+DB_COMPONENTS=$(run_sql "select comp_name, version, status from dba_registry;")
+
+# ------------------------------------------------------------------------------
+# DATAFILES
+# ------------------------------------------------------------------------------
+echo "[7] Datafiles"
+DATAFILES=$(run_sql "
+select file_name, tablespace_name, round(bytes/1024/1024,2) MB
+from dba_data_files;
+")
+
+# ------------------------------------------------------------------------------
+# REDO LOGS
+# ------------------------------------------------------------------------------
+echo "[8] Redologs"
+REDOLOGS=$(run_sql "select group#, thread#, bytes/1024/1024 MB, status from v\$log;")
+
+# ------------------------------------------------------------------------------
+# RMAN
+# ------------------------------------------------------------------------------
+echo "[9] RMAN Backup Info"
+RMAN_SUMMARY=$(rman target / <<EOF 2>/dev/null || true
+list backup summary;
+exit;
+EOF
+)
+RMAN_CONFIG=$(rman target / <<EOF 2>/dev/null || true
+show all;
+exit;
+EOF
+)
+
+# ------------------------------------------------------------------------------
+# LISTENER & TNS
+# ------------------------------------------------------------------------------
+echo "[10] Listener Status"
+LISTENER_STATUS=$(lsnrctl status 2>/dev/null || echo "Listener check failed")
+
+echo "[11] TNS Configuration"
+TNS_CONFIG=$(cat $ORACLE_HOME/network/admin/tnsnames.ora 2>/dev/null || echo "tnsnames.ora not found or inaccessible")
+
+# ------------------------------------------------------------------------------
+# PATCH INFO
+# ------------------------------------------------------------------------------
+echo "[12] Oracle Patch Info"
+PATCH_INFO=$($ORACLE_HOME/OPatch/opatch lspatches 2>/dev/null || echo "Patch info unavailable")
+
+# ------------------------------------------------------------------------------
+# SCHEDULER JOBS
+# ------------------------------------------------------------------------------
+echo "[13] Scheduler Jobs"
+SCHEDULER_JOBS=$(run_sql "
+select owner, job_name, enabled, state from dba_scheduler_jobs;
+")
+
+# ------------------------------------------------------------------------------
+# DB LINKS
+# ------------------------------------------------------------------------------
+echo "[14] DB Links"
+DB_LINKS=$(run_sql "select owner, db_link, host from dba_db_links;")
+
+# ------------------------------------------------------------------------------
+# ACTIVE SESSIONS
+# ------------------------------------------------------------------------------
+echo "[15] Active Sessions"
+ACTIVE_SESSIONS=$(run_sql "
+select sid, serial#, username, status, program
+from v\$session where username is not null;
+")
+
+# ------------------------------------------------------------------------------
+# DATAGUARD
+# ------------------------------------------------------------------------------
+echo "[16] Data Guard"
+DG_STATUS=$(run_sql "
+select database_role, protection_mode, protection_level, switchover_status
+from v\$database;
+")
+
+# ------------------------------------------------------------------------------
+# ASM
+# ------------------------------------------------------------------------------
+echo "[17] ASM Validation"
+ASM_CHECK=$(ps -ef | grep asm_pmon | grep -v grep || true)
+if [ -n "$ASM_CHECK" ]; then
+    ASM_STATUS="ASM CONFIGURED"
+    ASM_DISKGROUPS=$(run_sql "select name, state, type, total_mb, free_mb from v\$asm_diskgroup;")
+else
+    ASM_STATUS="NO ASM CONFIGURED"
+    ASM_DISKGROUPS="Filesystem based database"
+fi
+
+# ------------------------------------------------------------------------------
+# NEW: CLOUD READINESS / UNSUPPORTED FEATURES
+# ------------------------------------------------------------------------------
+echo "[18] Cloud Readiness (Unsupported Features Check)"
+UNSUPPORTED_FEATURES=$(run_sql "
+select 'Public Synonyms' as feature, count(*) as cnt from dba_synonyms where owner='PUBLIC'
+union all
+select 'OS Directories (UTL_FILE)', count(*) from dba_directories
+union all
+select 'Fine-Grained Auditing', count(*) from dba_audit_policies
+union all
+select 'Database Vault', count(*) from dba_dv_status where status = 'ENABLED';
+")
+
+# ------------------------------------------------------------------------------
+# NEW: OPEN DEFAULT ACCOUNTS
+# ------------------------------------------------------------------------------
+echo "[19] Default Accounts Security Check"
+DEFAULT_USERS=$(run_sql "
+SELECT username, account_status, expiry_date
+FROM dba_users
+WHERE username IN ('SCOTT', 'HR', 'DBSNMP', 'OUTLN', 'XS\$NULL', 'APEX_PUBLIC_USER', 'DIP', 'ORACLE_OCM')
+AND account_status = 'OPEN';
+")
+
+# ------------------------------------------------------------------------------
+# NEW: PARTITIONING (Licensing check)
+# ------------------------------------------------------------------------------
+echo "[20] Partitioning Check"
+PARTITIONING=$(run_sql "
+SELECT owner, count(*) as partitioned_tables
+FROM dba_tables WHERE partitioned = 'YES'
+GROUP BY owner;
+")
+
+# ------------------------------------------------------------------------------
+# NEW: MEMORY CONFIGURATION
+# ------------------------------------------------------------------------------
+echo "[21] Memory Configuration"
+MEMORY_CONFIG=$(run_sql "
+SELECT name,
+       display_value as value,
+       CASE WHEN isdefault = 'TRUE' THEN 'DEFAULT' ELSE 'MODIFIED' END as status
+FROM v\$parameter
+WHERE name IN ('memory_target', 'sga_target', 'pga_aggregate_target', 'use_large_pages')
+ORDER BY name;
+")
+
+# ------------------------------------------------------------------------------
+# OS INFO
+# ------------------------------------------------------------------------------
+echo "[22] OS Information"
+CPU_INFO=$(lscpu)
+MEMORY_INFO=$(free -g)
+DISK_INFO=$(df -h)
+LSBLK_INFO=$(lsblk)
+HUGEPAGES=$(grep Huge /proc/meminfo)
+KERNEL_INFO=$(uname -a)
+UPTIME_INFO=$(uptime)
+
+# ------------------------------------------------------------------------------
+# COLORS & BADGES LOGIC
+# ------------------------------------------------------------------------------
+if [ "${INVALID_COUNT:-0}" -gt 0 ]; then
+    INVALID_COLOR="#dc3545"
+else
+    INVALID_COLOR="#28a745"
+fi
+
+if [[ "$LOG_MODE" == "ARCHIVELOG" ]]; then
+    LOGMODE_COLOR="#28a745"
+    LOGMODE_BADGE="badge-success"
+else
+    LOGMODE_COLOR="#dc3545"
+    LOGMODE_BADGE="badge-danger"
+fi
+
+# ------------------------------------------------------------------------------
+# DYNAMIC MIGRATION RECOMMENDATION ENGINE
+# ------------------------------------------------------------------------------
+echo ""
+echo "Calculating Migration Recommendations..."
+
+if [ -z "$DB_SIZE_GB" ] || [ "$DB_SIZE_GB" == "NULL" ]; then
+    DB_SIZE_GB=0
+fi
+
+if awk "BEGIN {exit !($DB_SIZE_GB > 2000)}"; then
+    MIG_METHOD="Data Pump (Parallel Export/Import) or Hybrid (Datapump + RMAN Incremental)"
+    MIG_DOWNTIME="12 to 48 Hours (Depends on Network & Object Count)"
+    MIG_REASON="- Database size is > 2TB ($DB_SIZE_GB GB).\n- Full RMAN restore over network is too slow.\n- Schema-level Data Pump allows parallelism and throttling."
+elif awk "BEGIN {exit !($DB_SIZE_GB > 500)}"; then
+    MIG_METHOD="RMAN Duplicate (Active) or Cloud Backup Restore"
+    MIG_DOWNTIME="4 to 8 Hours"
+    MIG_REASON="- Medium sized database ($DB_SIZE_GB GB).\n- RMAN Duplicate is reliable if network bandwidth is sufficient."
+else
+    MIG_METHOD="RMAN Backup & Restore or Data Pump"
+    MIG_DOWNTIME="1 to 3 Hours"
+    MIG_REASON="- Small database ($DB_SIZE_GB GB).\n- Fast to move. Standard methods apply."
+fi
+
+if [[ "$LOG_MODE" != "ARCHIVELOG" ]]; then
+    MIG_REASON="$MIG_REASON\n- WARNING: Database is in NOARCHIVELOG mode. RMAN Duplication will fail. Data Pump or Cold Backup required."
+fi
+
+if [[ "$CHARSET" != "AL32UTF8" ]]; then
+    MIG_REASON="$MIG_REASON\n- WARNING: Character set is $CHARSET (Not AL32UTF8). Character conversion may be required, increasing downtime."
+fi
+
+# Convert newlines to HTML line breaks for the report
+MIG_REASON_HTML=$(echo -e "$MIG_REASON" | sed 's/$/<br>/')
+
+# ------------------------------------------------------------------------------
+# HTML REPORT GENERATION
+# ------------------------------------------------------------------------------
+echo "Generating HTML report..."
+
+cat > "$REPORT" <<EOF
+<html>
+<head>
+    <title>Oracle Migration POA Report</title>
+    <style>
+        body { font-family: Segoe UI, Tahoma, Arial, sans-serif; background: #e9ecef; margin: 20px; color: #333; }
+        h1 { color: #003366; border-bottom: 3px solid #003366; padding-bottom: 10px; }
+        h2 { background: #003366; color: white; padding: 12px; margin-top: 30px; border-radius: 4px 4px 0 0; }
+        .section { background: white; padding: 0; margin-bottom: 25px; border-radius: 5px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); overflow: hidden; }
+        .section-content { padding: 20px; }
+        pre { background: #f8f9fa; padding: 15px; overflow-x: auto; border: 1px solid #dee2e6; border-radius: 4px; font-size: 13px; line-height: 1.5; }
+        .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .info-box { background: #f8f9fa; border-left: 4px solid #003366; padding: 15px; }
+        .badge { padding: 5px 10px; border-radius: 4px; color: white; font-weight: bold; font-size: 12px; }
+        .badge-success { background-color: #28a745; }
+        .badge-danger { background-color: #dc3545; }
+        .badge-warning { background-color: #ffc107; color: black; }
+        .recommendation-box { background: #e7f5ff; border: 1px solid #0077b6; padding: 20px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+<h1>Oracle Migration Assessment Report</h1>
+
+<div class="section">
+    <h2>General Information</h2>
+    <div class="section-content grid-container">
+        <div class="info-box">
+            <strong>Generated Date:</strong> $DATE<br>
+            <strong>Hostname:</strong> $HOSTNAME<br>
+            <strong>IP Address:</strong> $IP
+        </div>
+        <div class="info-box">
+            <strong>Oracle SID:</strong> $ORACLE_SID<br>
+            <strong>Oracle Home:</strong> $ORACLE_HOME<br>
+            <strong>Oracle Version:</strong> $DB_VERSION
+        </div>
+        <div class="info-box">
+            <strong>Database Name:</strong> $DB_NAME<br>
+            <strong>Database Role:</strong> $DB_ROLE<br>
+            <strong>Open Mode:</strong> $OPEN_MODE
+        </div>
+        <div class="info-box">
+            <strong>Log Mode:</strong> <span class="badge $LOGMODE_BADGE">$LOG_MODE</span><br>
+            <strong>Character Set:</strong> $CHARSET<br>
+            <strong>Allocated Size:</strong> $DB_SIZE_GB GB<br>
+            <strong>ASM Status:</strong> $ASM_STATUS
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Instance & Database Status</h2>
+    <div class="section-content grid-container">
+        <div><pre>$DATABASE_INFO</pre></div>
+        <div><pre>$INSTANCE_INFO</pre></div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Tablespace Allocation (Allocated Space)</h2>
+    <div class="section-content"><pre>$TABLESPACE_INFO</pre></div>
+</div>
+
+<div class="section" style="border-top: 5px solid #0077b6;">
+    <h2>Tablespace Actual Usage (Used vs Free)</h2>
+    <div class="section-content"><pre>$TABLESPACE_USAGE</pre></div>
+</div>
+
+<div class="section" style="border-top: 5px solid #0077b6;">
+    <h2>Top Schema Sizes (Data Consumers)</h2>
+    <div class="section-content"><pre>$SCHEMA_SIZES</pre></div>
+</div>
+
+<div class="section">
+    <h2>Invalid Objects <span class="badge" style="background-color: $INVALID_COLOR; float: right; margin-top: -5px;">Count: $INVALID_COUNT</span></h2>
+    <div class="section-content"><pre>$INVALID_OBJECTS</pre></div>
+</div>
+
+<div class="section">
+    <h2>Database Components</h2>
+    <div class="section-content"><pre>$DB_COMPONENTS</pre></div>
+</div>
+
+<div class="section">
+    <h2>Datafiles</h2>
+    <div class="section-content"><pre>$DATAFILES</pre></div>
+</div>
+
+<div class="section">
+    <h2>Redo Logs</h2>
+    <div class="section-content"><pre>$REDOLOGS</pre></div>
+</div>
+
+<div class="section">
+    <h2>RMAN Backup Summary</h2>
+    <div class="section-content"><pre>$RMAN_SUMMARY</pre></div>
+</div>
+
+<div class="section">
+    <h2>RMAN Configuration</h2>
+    <div class="section-content"><pre>$RMAN_CONFIG</pre></div>
+</div>
+
+<div class="section">
+    <h2>Listener Status</h2>
+    <div class="section-content"><pre>$LISTENER_STATUS</pre></div>
+</div>
+
+<div class="section">
+    <h2>TNS Names Configuration</h2>
+    <div class="section-content"><pre>$TNS_CONFIG</pre></div>
+</div>
+
+<div class="section">
+    <h2>Patch Information</h2>
+    <div class="section-content"><pre>$PATCH_INFO</pre></div>
+</div>
+
+<div class="section">
+    <h2>Scheduler Jobs</h2>
+    <div class="section-content"><pre>$SCHEDULER_JOBS</pre></div>
+</div>
+
+<div class="section">
+    <h2>Database Links</h2>
+    <div class="section-content"><pre>$DB_LINKS</pre></div>
+</div>
+
+<div class="section">
+    <h2>Active Sessions</h2>
+    <div class="section-content"><pre>$ACTIVE_SESSIONS</pre></div>
+</div>
+
+<div class="section">
+    <h2>Data Guard Status</h2>
+    <div class="section-content"><pre>$DG_STATUS</pre></div>
+</div>
+
+<div class="section">
+    <h2>ASM Information</h2>
+    <div class="section-content"><pre>$ASM_DISKGROUPS</pre></div>
+</div>
+
+<div class="section" style="border-top: 5px solid #dc3545;">
+    <h2>Cloud Readiness & Security Checks</h2>
+    <div class="section-content grid-container">
+        <div>
+            <h3>Potential Showstoppers / Unsupported Features (Managed Cloud)</h3>
+            <pre>$UNSUPPORTED_FEATURES</pre>
+        </div>
+        <div>
+            <h3>Open Default Accounts (Security Risk)</h3>
+            <pre>$DEFAULT_USERS</pre>
+        </div>
+        <div>
+            <h3>Partitioning Usage (Licensing Implications)</h3>
+            <pre>$PARTITIONING</pre>
+        </div>
+        <div>
+            <h3>Memory Configuration (Container/K8s Readiness)</h3>
+            <pre>$MEMORY_CONFIG</pre>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>OS & Infrastructure Information</h2>
+    <div class="section-content grid-container">
+        <div><pre>$CPU_INFO</pre></div>
+        <div><pre>$MEMORY_INFO</pre></div>
+        <div><pre>$DISK_INFO</pre></div>
+        <div><pre>$HUGEPAGES</pre></div>
+        <div><pre>$KERNEL_INFO</pre></div>
+        <div><pre>$UPTIME_INFO</pre></div>
+        <div style="grid-column: 1 / -1;"><pre>$LSBLK_INFO</pre></div>
+    </div>
+</div>
+
+<div class="section" style="border: 2px solid #003366;">
+    <h2>Dynamic Migration Recommendation</h2>
+    <div class="section-content recommendation-box">
+        <p><strong>Recommended Method:</strong><br>$MIG_METHOD</p>
+        <br>
+        <p><strong>Estimated Downtime:</strong><br>$MIG_DOWNTIME</p>
+        <br>
+        <p><strong>Technical Reasoning & Warnings:</strong><br>
+        $MIG_REASON_HTML
+        </p>
+    </div>
+</div>
+
+</body>
+</html>
+EOF
+
+# ------------------------------------------------------------------------------
+# FINAL OUTPUT
+# ------------------------------------------------------------------------------
+echo ""
+echo "========================================================"
+echo " Oracle Migration POA Completed"
+echo "========================================================"
+echo ""
+echo "HTML Report:"
+echo "$REPORT"
+echo ""
+echo "LOG File:"
+echo "$LOG"
+echo ""
+echo "Open report:"
+echo ""
+echo "firefox $REPORT &"
+echo ""
+echo "========================================================"
