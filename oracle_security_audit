@@ -1,0 +1,348 @@
+#!/bin/bash
+
+################################################################################
+# Oracle Security Hardening & VAPT Readiness Assessment Script
+# Version : Enterprise Audit Edition
+################################################################################
+
+set -uo pipefail
+
+REPORT_DIR="$(pwd)/security_audit_$(date +%Y%m%d_%H%M%S)"
+REPORT="${REPORT_DIR}/oracle_security_poa.html"
+LOG="${REPORT_DIR}/audit_collection.log"
+
+mkdir -p "$REPORT_DIR"
+exec > >(tee -a "$LOG") 2>&1
+
+echo "========================================================"
+echo " Oracle Security & Hardening Assessment"
+echo " Started : $(date)"
+echo "========================================================"
+
+# ------------------------------------------------------------------------------
+# ORACLE ENVIRONMENT
+# ------------------------------------------------------------------------------
+export ORACLE_SID=${ORACLE_SID:-$(echo $ORACLE_SID)}
+ORACLE_HOME_FROM_TAB=$(grep "^${ORACLE_SID}:" /etc/oratab 2>/dev/null | awk -F: '{print $2}')
+export ORACLE_HOME=${ORACLE_HOME_FROM_TAB:-${ORACLE_HOME:-""}}
+export PATH=$ORACLE_HOME/bin:$PATH
+
+DATE=$(date "+%d-%b-%Y %H:%M:%S")
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+DB_NAME=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+select name from v\$database;
+exit;
+EOF
+)
+
+# ------------------------------------------------------------------------------
+# SQL FUNCTIONS
+# ------------------------------------------------------------------------------
+run_sql() {
+sqlplus -s "/ as sysdba" <<EOF
+set pagesize 500
+set linesize 300
+set feedback off
+set heading on
+set trimspool on
+set wrap off
+ $1
+exit;
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# 1. CRITICAL: Default & Open Accounts
+# ------------------------------------------------------------------------------
+echo "[1] Checking Default and Open Accounts..."
+DEFAULT_ACCOUNTS=$(run_sql "
+SELECT username, account_status, expiry_date, lock_date
+FROM dba_users
+WHERE username IN (
+    'SCOTT','HR','SH','PM','IX','OE','BI','CTXSYS','DBSNMP','EXFSYS','MDSYS',
+    'OLAPSYS','ORDSYS','OUTLN','WMSYS','XDB','ANONYMOUS','APEX_040000',
+    'APEX_PUBLIC_USER','DIP','FLOWS_FILES','MDDATA','ORACLE_OCM','XS\$NULL',
+    'SI_INFORMTN_SCHEMA','SPATIAL_CSW_ADMIN_USR','SPATIAL_WFS_ADMIN_USR'
+)
+ORDER BY account_status, username;
+")
+
+OPEN_DEFAULT_COUNT=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+SELECT count(*) FROM dba_users
+WHERE account_status = 'OPEN'
+AND username IN ('SCOTT','HR','DBSNMP','ANONYMOUS','APEX_PUBLIC_USER','XDB','OUTLN');
+exit;
+EOF
+)
+
+# ------------------------------------------------------------------------------
+# 2. CRITICAL: Users with Default Passwords
+# ------------------------------------------------------------------------------
+echo "[2] Checking for Default Passwords..."
+# Note: This query works on 11g to 19c. On 23ai, views changed slightly.
+DEFAULT_PASSWORDS=$(run_sql "
+SELECT username
+FROM dba_users_with_defpwd
+WHERE username NOT IN ('SYS','SYSTEM')
+ORDER BY username;
+" 2>/dev/null || echo "Note: dba_users_with_defpwd view unavailable or empty.")
+
+# ------------------------------------------------------------------------------
+# 3. HIGH: Excessive Privileges (Users with DBA role)
+# ------------------------------------------------------------------------------
+echo "[3] Checking Excessive DBA Privileges..."
+DBA_USERS=$(run_sql "
+SELECT grantee, granted_role, admin_option
+FROM dba_role_privs
+WHERE granted_role = 'DBA'
+AND grantee NOT IN ('SYS','SYSTEM','SYSBACKUP','SYSDG','SYSKM','XDB')
+ORDER BY grantee;
+")
+
+# ------------------------------------------------------------------------------
+# 4. HIGH: Public Synonyms (Gateway to data exfiltration)
+# ------------------------------------------------------------------------------
+echo "[4] Checking Public Synonyms..."
+PUBLIC_SYNONYMS=$(run_sql "
+SELECT object_type, count(*) as count
+FROM dba_objects
+WHERE owner = 'PUBLIC'
+AND object_type IN ('SYNONYM', 'VIEW', 'PROCEDURE', 'FUNCTION')
+GROUP BY object_type
+ORDER BY count DESC;
+")
+
+# ------------------------------------------------------------------------------
+# 5. MEDIUM: Password Profile Settings (CIS Benchmarks)
+# ------------------------------------------------------------------------------
+echo "[5] Checking Password Profiles..."
+# Auditors want to see: Password life <= 90, Lock after 5 fails, complex passwords
+PROFILE_SETTINGS=$(run_sql "
+SELECT profile, resource_name, resource_type, limit
+FROM dba_profiles
+WHERE resource_type = 'PASSWORD'
+AND profile IN ('DEFAULT', 'SECURE_PROFILE')
+ORDER BY profile, resource_name;
+")
+
+# ------------------------------------------------------------------------------
+# 6. MEDIUM: Failed Login Tracking (Auding)
+# ------------------------------------------------------------------------------
+echo "[6] Checking Audit Settings for Failed Logins..."
+AUDIT_SETTINGS=$(run_sql "
+SELECT user_name, audit_option, success, failure
+FROM dba_priv_audit_opts
+WHERE audit_option LIKE '%LOGON%'
+UNION ALL
+SELECT user_name, audit_option, success, failure
+FROM dba_stmt_audit_opts
+WHERE audit_option LIKE '%LOGON%';
+" 2>/dev/null || echo "Database Auditing not fully configured.")
+
+# ------------------------------------------------------------------------------
+# 7. LOW: Listener Security (Password & External checks)
+# ------------------------------------------------------------------------------
+echo "[7] Checking Listener Security..."
+# Checking if listener has a password or allows admin by default
+LSNR_SECURITY=$(lsnrctl status 2>/dev/null | grep -iE "Security|Password")
+if [ -z "$LSNR_SECURITY" ]; then
+    LSNR_SECURITY="WARNING: No security output detected. Listener may be unprotected."
+fi
+
+# ------------------------------------------------------------------------------
+# 8. CRITICAL: Dictionary Access (O7_DICTIONARY_ACCESSIBILITY)
+# ------------------------------------------------------------------------------
+echo "[8] Checking Dictionary Access Protection..."
+DICT_ACCESS=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+SELECT value FROM v\$parameter2 WHERE name = 'O7_DICTIONARY_ACCESSIBILITY';
+exit;
+EOF
+)
+if [[ "$DICT_ACCESS" == "TRUE" ]]; then
+    DICT_STATUS="CRITICAL: TRUE (Any user with SELECT ANY TABLE can read SYS tables)"
+    DICT_COLOR="#dc3545"
+else
+    DICT_STATUS="SAFE: FALSE (SYS schema is protected)"
+    DICT_COLOR="#28a745"
+fi
+
+# ------------------------------------------------------------------------------
+# DYNAMIC RECOMMENDATION ENGINE
+# ------------------------------------------------------------------------------
+echo "Calculating Security POA..."
+RECOMMENDATIONS="<ul>"
+
+if [ "${OPEN_DEFAULT_COUNT:-0}" -gt 0 ]; then
+    RECOMMENDATIONS+=" <li><strong>CRITICAL:</strong> Lock and expire $OPEN_DEFAULT_COUNT default open accounts (e.g., SCOTT, DBSNMP, ANONYMOUS).</li>"
+fi
+
+if [ -n "$DEFAULT_PASSWORDS" ] && [[ ! "$DEFAULT_PASSWORDS" =~ "unavailable" ]]; then
+    RECOMMENDATIONS+=" <li><strong>CRITICAL:</strong> Users found with default passwords. Change them immediately.</li>"
+fi
+
+if [ -n "$DBA_USERS" ]; then
+    RECOMMENDATIONS+=" <li><strong>HIGH:</strong> Unauthorized users have the DBA role. Revoke DBA and grant specific system privileges instead.</li>"
+fi
+
+if [[ "$DICT_ACCESS" == "TRUE" ]]; then
+    RECOMMENDATIONS+=" <li><strong>CRITICAL:</strong> Set O7_DICTIONARY_ACCESSIBILITY=FALSE in the spfile.</li>"
+fi
+
+if echo "$PROFILE_SETTINGS" | grep -qiE "UNLIMITED|NULL"; then
+    RECOMMENDATIONS+=" <li><strong>MEDIUM:</strong> Password profiles are weak (UNLIMITED). Enforce password complexity, lifetime (90 days), and lock time (5 failed attempts).</li>"
+fi
+
+if echo "$PUBLIC_SYNONYMS" | grep -q "SYNONYM"; then
+    RECOMMENDATIONS+=" <li><strong>MEDIUM:</strong> Drop unnecessary PUBLIC synonyms to prevent data exfiltration via low-privileged users.</li>"
+fi
+
+if echo "$AUDIT_SETTINGS" | grep -q "no rows selected"; then
+    RECOMMENDATIONS+=" <li><strong>MEDIUM:</strong> Audit policies for failed logons are not enabled. Enable unified auditing or standard auditing for failed logins.</li>"
+fi
+
+if echo "$LSNR_SECURITY" | grep -qi "WARNING"; then
+    RECOMMENDATIONS+=" <li><strong>HIGH:</strong> Secure the Oracle Listener. Turn on local OS authentication for listener administration.</li>"
+fi
+
+# If all passed
+if [ "${OPEN_DEFAULT_COUNT:-0}" -eq 0 ] && [ -z "$DBA_USERS" ] && [[ "$DICT_ACCESS" == "FALSE" ]]; then
+    RECOMMENDATIONS+=" <li><strong>GOOD:</strong> Core database security configurations look solid based on initial scans.</li>"
+fi
+
+RECOMMENDATIONS+="</ul>"
+
+# ------------------------------------------------------------------------------
+# HTML REPORT GENERATION
+# ------------------------------------------------------------------------------
+echo "Generating HTML Report..."
+
+cat > "$REPORT" <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Oracle Security & Hardening POA</title>
+    <style>
+        body { font-family: Segoe UI, Tahoma, sans-serif; background: #f4f6f9; margin: 20px; color: #333; }
+        h1 { color: #b71c1c; border-bottom: 3px solid #b71c1c; padding-bottom: 10px; }
+        h2 { background: #b71c1c; color: white; padding: 12px; margin-top: 30px; border-radius: 4px 4px 0 0; }
+        h3 { color: #d32f2f; margin-bottom: 5px; }
+        .section { background: white; padding: 0; margin-bottom: 25px; border-radius: 5px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); overflow: hidden; }
+        .section-content { padding: 20px; }
+        pre { background: #fff5f5; padding: 15px; overflow-x: auto; border: 1px solid #ffcdd2; border-radius: 4px; font-size: 13px; }
+        .grid-container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .safe-box { background: #e8f5e9; border-left: 5px solid #28a745; padding: 15px; font-weight: bold; color: #28a745; }
+        .danger-box { background: #ffebee; border-left: 5px solid #dc3545; padding: 15px; font-weight: bold; color: #dc3545; }
+        .poa-box { background: #e3f2fd; border: 2px solid #1565c0; padding: 20px; border-radius: 5px; margin-top: 20px; }
+        .poa-box ul { margin-bottom: 0; }
+        .poa-box li { margin-bottom: 10px; line-height: 1.5; }
+        .header-info { background: white; padding: 20px; border-radius: 5px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    </style>
+</head>
+<body>
+
+<h1>🛡️ Oracle Security & VAPT Readiness Report</h1>
+
+<div class="header-info">
+    <strong>Audit Date:</strong> $DATE<br>
+    <strong>Target Host:</strong> $HOSTNAME<br>
+    <strong>Target Database:</strong> $DB_NAME
+</div>
+
+<div class="section">
+    <h2>1. Dictionary Access Protection (O7_DICTIONARY_ACCESSIBILITY)</h2>
+    <div class="section-content">
+        <div class="$([ "$DICT_ACCESS" == "TRUE" ] && echo "danger-box" || echo "safe-box")">
+            $DICT_STATUS
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>2. Default & Open Accounts (CIS Benchmark)</h2>
+    <div class="section-content">
+        <p>Auditors strictly require locking Oracle default schemas unless explicitly used.</p>
+        <pre>$DEFAULT_ACCOUNTS</pre>
+    </div>
+</div>
+
+<div class="section">
+    <h2>3. Users with Default Passwords</h2>
+    <div class="section-content">
+        <pre>$DEFAULT_PASSWORDS</pre>
+    </div>
+</div>
+
+<div class="section">
+    <h2>4. Excessive Privileges (DBA Role Assignment)</h2>
+    <div class="section-content">
+        <p>Standard users should NOT have the DBA role. Use granular privileges instead.</p>
+        <pre>$DBA_USERS</pre>
+    </div>
+</div>
+
+<div class="section">
+    <h2>5. Password Profile Settings</h2>
+    <div class="section-content grid-container">
+        <div>
+            <h3>Current Profile Configuration</h3>
+            <pre>$PROFILE_SETTINGS</pre>
+        </div>
+        <div>
+            <h3>Expected (CIS Benchmark)</h3>
+            <pre>
+Failed_Login_Attempts    -> 5
+Password_Life_Time       -> 90
+Password_Reuse_Time      -> 365
+Password_Lock_Time       -> 1/1440 (1 day)
+Password_Verify_Function -> ORA12C_VERIFY_FUNCTION
+            </pre>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>6. Public Synonyms Risk</h2>
+    <div class="section-content">
+        <p>Public synonyms allow any user in the database to access objects without direct grants, increasing the attack surface.</p>
+        <pre>$PUBLIC_SYNONYMS</pre>
+    </div>
+</div>
+
+<div class="section">
+    <h2>7. Audit Configuration (Failed Logins)</h2>
+    <div class="section-content">
+        <pre>$AUDIT_SETTINGS</pre>
+    </div>
+</div>
+
+<div class="section">
+    <h2>8. Listener Security</h2>
+    <div class="section-content">
+        <pre>$LSNR_SECURITY</pre>
+    </div>
+</div>
+
+<div class="section" style="border: 2px solid #1565c0;">
+    <h2 style="background: #1565c0;">Plan of Action (POA) for VAPT Hardening</h2>
+    <div class="section-content poa-box">
+        <p>Execute the following steps in order to pass standard Security Audits (CIS / DISA STIG):</p>
+        $RECOMMENDATIONS
+    </div>
+</div>
+
+</body>
+</html>
+EOF
+
+echo ""
+echo "========================================================"
+echo " Security Audit Completed"
+echo "========================================================"
+echo "HTML Report : $REPORT"
+echo "Log File    : $LOG"
+echo ""
+echo "To view: firefox $REPORT &"
+echo "========================================================"
