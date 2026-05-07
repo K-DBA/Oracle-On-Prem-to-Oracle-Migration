@@ -1,0 +1,269 @@
+#!/bin/bash
+
+################################################################################
+# Oracle Advanced VAPT & Deep Security Assessment Script
+################################################################################
+
+set -uo pipefail
+
+REPORT_DIR="$(pwd)/security_deep_dive_$(date +%Y%m%d_%H%M%S)"
+REPORT="${REPORT_DIR}/oracle_deep_security_poa.html"
+LOG="${REPORT_DIR}/deep_audit.log"
+
+mkdir -p "$REPORT_DIR"
+exec > >(tee -a "$LOG") 2>&1
+
+echo "========================================================"
+echo " Oracle Advanced Security Deep-Dive"
+echo " Started : $(date)"
+echo "========================================================"
+
+export ORACLE_SID=${ORACLE_SID:-$(echo $ORACLE_SID)}
+ORACLE_HOME_FROM_TAB=$(grep "^${ORACLE_SID}:" /etc/oratab 2>/dev/null | awk -F: '{print $2}')
+export ORACLE_HOME=${ORACLE_HOME_FROM_TAB:-${ORACLE_HOME:-""}}
+export PATH=$ORACLE_HOME/bin:$PATH
+
+DATE=$(date "+%d-%b-%Y %H:%M:%S")
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+
+run_sql() {
+sqlplus -s "/ as sysdba" <<EOF
+set pagesize 500
+set linesize 300
+set feedback off
+set heading on
+set trimspool on
+set wrap off
+ $1
+exit;
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# 1. CRITICAL: Data Encryption at Rest (TDE)
+# ------------------------------------------------------------------------------
+echo "[1] Checking Transparent Data Encryption (TDE)..."
+TDE_STATUS=$(run_sql "
+SELECT status FROM dba_encrypted_columns WHERE rownum = 1;
+" 2>/dev/null)
+
+if [ -z "$TDE_STATUS" ]; then
+    TDE_OUTPUT="WARNING: No encrypted columns found. Sensitive data (PII, PCI) might be stored in clear text."
+    TDE_CLASS="danger-box"
+else
+    TDE_OUTPUT="SAFE: TDE is implemented in the database."
+    TDE_CLASS="safe-box"
+fi
+
+# ------------------------------------------------------------------------------
+# 2. HIGH: Network Encryption (Oracle Net Encryption)
+# ------------------------------------------------------------------------------
+echo "[2] Checking Network Encryption (sqlnet.ora)..."
+# Auditors want to see: SQLNET.ENCRYPTION_SERVER = REQUIRED or ACCEPTED
+NET_ENCRYPT=$(grep -iE "^SQLNET.ENCRYPTION_SERVER|^SQLNET.CRYPTO_CHECKSUM_SERVER" $ORACLE_HOME/network/admin/sqlnet.ora 2>/dev/null)
+
+if [ -z "$NET_ENCRYPT" ]; then
+    NET_OUTPUT="CRITICAL: Network encryption is NOT configured. Data flows between App and DB in clear text (can be sniffed)."
+    NET_CLASS="danger-box"
+else
+    NET_OUTPUT="SAFE: Network encryption parameters found:\n$NET_ENCRYPT"
+    NET_CLASS="safe-box"
+fi
+
+# ------------------------------------------------------------------------------
+# 3. HIGH: Remote OS Authentication
+# ------------------------------------------------------------------------------
+echo "[3] Checking Remote OS Authentication..."
+# If TRUE, anyone who logs into the OS server can connect to DB as SYS without a password.
+REMOTE_AUTH=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+SELECT value FROM v\$parameter2 WHERE name = 'REMOTE_OS_AUTHENT';
+exit;
+EOF
+)
+
+if [[ "$REMOTE_AUTH" == "TRUE" ]]; then
+    REMOTE_OUTPUT="CRITICAL: REMOTE_OS_AUTHENT is TRUE. This is a massive security risk."
+    REMOTE_CLASS="danger-box"
+else
+    REMOTE_OUTPUT="SAFE: REMOTE_OS_AUTHENT is FALSE."
+    REMOTE_CLASS="safe-box"
+fi
+
+# ------------------------------------------------------------------------------
+# 4. CRITICAL: SYS Audit Trail (SYS.AUD$)
+# ------------------------------------------------------------------------------
+echo "[4] Checking SYS Audit Trail Protection..."
+# Auditors require the audit trail to be in the SYS schema, NOT in a user tablespace
+AUDIT_TRAIL_LOC=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+SELECT tablespace_name FROM dba_tables WHERE table_name = 'AUD$' AND owner = 'SYS';
+exit;
+EOF
+)
+
+if [[ "$AUDIT_TRAIL_LOC" == "SYSTEM" ]]; then
+    AUDIT_LOC_OUTPUT="SAFE: Audit trail (AUD\$) is in the SYSTEM tablespace."
+    AUDIT_LOC_CLASS="safe-box"
+elif [ -z "$AUDIT_TRAIL_LOC" ]; then
+    AUDIT_LOC_OUTPUT="WARNING: Standard auditing is not enabled or AUD$ table does not exist."
+    AUDIT_LOC_CLASS="danger-box"
+else
+    AUDIT_LOC_OUTPUT="CRITICAL: Audit trail is in '$AUDIT_TRAIL_LOC'. DBAs can hide their tracks by truncating this tablespace. Move to SYSTEM."
+    AUDIT_LOC_CLASS="danger-box"
+fi
+
+# ------------------------------------------------------------------------------
+# 5. MEDIUM: Extreme Privileges (ANY TABLE, ANY PROCEDURE)
+# ------------------------------------------------------------------------------
+echo "[5] Checking for Excessive ANY Privileges..."
+EXCESSIVE_PRIVS=$(run_sql "
+SELECT grantee, privilege, admin_option
+FROM dba_sys_privs
+WHERE privilege LIKE '%ANY TABLE%'
+   OR privilege LIKE '%ANY PROCEDURE%'
+   OR privilege LIKE '%ANY INDEX%'
+   OR privilege = 'ALTER SYSTEM'
+   OR privilege = 'DROP ANY TABLE'
+AND grantee NOT IN ('SYS','SYSTEM','DBSNMP','SYSBACKUP','SYSDG','SYSKM','XDB','AUDSYS')
+AND grantee NOT IN (SELECT role FROM dba_roles)
+ORDER BY grantee;
+")
+
+# ------------------------------------------------------------------------------
+# 6. LOW: Directory Objects (UTL_FILE Access)
+# ------------------------------------------------------------------------------
+echo "[6] Checking OS Directory Access..."
+DIR_ACCESS=$(run_sql "
+SELECT directory_name, directory_path, grantee, privilege
+FROM dba_directories d
+JOIN dba_tab_privs p ON d.directory_name = p.table_name
+WHERE p.privilege IN ('READ', 'WRITE', 'EXECUTE')
+ORDER BY directory_name;
+")
+
+# ------------------------------------------------------------------------------
+# DYNAMIC POA ENGINE
+# ------------------------------------------------------------------------------
+echo "Calculating Deep-Dive POA..."
+POA="<ul>"
+
+if [[ "$TDE_OUTPUT" == *"WARNING"* ]]; then
+    POA+=" <li><strong>CRITICAL:</strong> Implement Transparent Data Encryption (TDE) for columns containing PII, passwords, or financial data.</li>"
+fi
+
+if [[ "$NET_OUTPUT" == *"CRITICAL"* ]]; then
+    POA+=" <li><strong>CRITICAL:</strong> Edit sqlnet.ora and add <code>SQLNET.ENCRYPTION_SERVER=REQUIRED</code> and <code>SQLNET.ENCRYPTION_TYPES_SERVER=(AES256)</code> to prevent network sniffing.</li>"
+fi
+
+if [[ "$REMOTE_OUTPUT" == *"CRITICAL"* ]]; then
+    POA+=" <li><strong>CRITICAL:</strong> Set REMOTE_OS_AUTHENT=FALSE in the spfile immediately.</li>"
+fi
+
+if [[ "$AUDIT_LOC_OUTPUT" == *"CRITICAL"* ]]; then
+    POA+=" <li><strong>HIGH:</strong> Move the AUD$ table to the SYSTEM tablespace by running: <code>BEGIN DBMS_AUDIT_MGMT.SET_AUDIT_TRAIL_LOCATION(audit_trail_type => DBMS_AUDIT_MGMT.AUDIT_TRAIL_DB_STD, audit_trail_location_value => 'SYSTEM'); END;</code></li>"
+fi
+
+if [ -n "$EXCESSIVE_PRIVS" ]; then
+    POA+=" <li><strong>MEDIUM:</strong> Revoke 'ANY TABLE' and 'ANY PROCEDURE' from non-DBA users. Grant access to specific schemas instead.</li>"
+fi
+
+if [ -z "$POA" ] || [[ "$POA" == "<ul>" ]]; then
+    POA+=" <li><strong>EXCELLENT:</strong> No advanced critical vulnerabilities detected. Database meets strict enterprise hardening standards.</li>"
+fi
+
+POA+="</ul>"
+
+POA_HTML=$(echo -e "$POA")
+
+# ------------------------------------------------------------------------------
+# HTML REPORT
+# ------------------------------------------------------------------------------
+echo "Generating HTML Report..."
+
+cat > "$REPORT" <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Deep Security VAPT Report</title>
+    <style>
+        body { font-family: Segoe UI, Tahoma, sans-serif; background: #f4f6f9; margin: 20px; color: #333; }
+        h1 { color: #1a237e; border-bottom: 3px solid #1a237e; padding-bottom: 10px; }
+        h2 { background: #283593; color: white; padding: 12px; margin-top: 30px; border-radius: 4px 4px 0 0; }
+        .section { background: white; padding: 0; margin-bottom: 25px; border-radius: 5px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); overflow: hidden; }
+        .section-content { padding: 20px; }
+        pre { background: #f3f4f6; padding: 15px; overflow-x: auto; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
+        .safe-box { background: #e8f5e9; border-left: 5px solid #28a745; padding: 15px; font-weight: bold; color: #2e7d32; white-space: pre-wrap; }
+        .danger-box { background: #ffebee; border-left: 5px solid #dc3545; padding: 15px; font-weight: bold; color: #c62828; white-space: pre-wrap; }
+        .poa-box { background: #e8eaf6; border: 2px solid #283593; padding: 20px; border-radius: 5px; margin-top: 20px; }
+        .poa-box ul { margin-bottom: 0; }
+        .poa-box li { margin-bottom: 10px; line-height: 1.6; }
+        code { background: #ddd; padding: 2px 5px; border-radius: 3px; font-family: monospace; }
+    </style>
+</head>
+<body>
+
+<h1>🔬 Advanced Security Deep-Dive Report</h1>
+
+<div class="section">
+    <h2>1. Data Encryption at Rest (TDE)</h2>
+    <div class="section-content">
+        <div class="$TDE_CLASS">$TDE_OUTPUT</div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>2. Network Encryption (Data in Transit)</h2>
+    <div class="section-content">
+        <div class="$NET_CLASS">$NET_OUTPUT</div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>3. Remote OS Authentication</h2>
+    <div class="section-content">
+        <div class="$REMOTE_CLASS">$REMOTE_OUTPUT</div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>4. Audit Trail Integrity (AUD$ Location)</h2>
+    <div class="section-content">
+        <div class="$AUDIT_LOC_CLASS">$AUDIT_LOC_OUTPUT</div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>5. Excessive System Privileges (ANY TABLE / ANY PROCEDURE)</h2>
+    <div class="section-content">
+        <p>Granting 'ANY' privileges violates Least Privilege. If a user has SELECT ANY TABLE, they can read HR, Finance, and SYS schemas.</p>
+        <pre>$EXCESSIVE_PRIVS</pre>
+    </div>
+</div>
+
+<div class="section">
+    <h2>6. OS Directory Access (UTL_FILE)</h2>
+    <div class="section-content">
+        <p>Access to Oracle Directories allows the database to read/write to the server OS. Ensure only back-end processes have WRITE access.</p>
+        <pre>$DIR_ACCESS</pre>
+    </div>
+</div>
+
+<div class="section" style="border: 2px solid #283593;">
+    <h2 style="background: #283593;">Deep-Dive Plan of Action (POA)</h2>
+    <div class="section-content poa-box">
+        $POA_HTML
+    </div>
+</div>
+
+</body>
+</html>
+EOF
+
+echo ""
+echo "========================================================"
+echo " Deep-Dive Audit Completed"
+echo "========================================================"
+echo "HTML Report : $REPORT"
+echo "To view: firefox $REPORT &"
+echo "========================================================"
