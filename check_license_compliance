@@ -1,0 +1,276 @@
+#!/bin/bash
+
+################################################################################
+# Oracle Standard Edition License Compliance Check
+# WARNING: Identifies features that may require Enterprise Edition licenses
+################################################################################
+
+set -uo pipefail
+
+REPORT_DIR="$(pwd)/license_audit_$(date +%Y%m%d_%H%M%S)"
+REPORT="${REPORT_DIR}/license_compliance.html"
+LOG="${REPORT_DIR}/license_check.log"
+
+mkdir -p "$REPORT_DIR"
+exec > >(tee -a "$LOG") 2>&1
+
+echo "========================================================"
+echo " Oracle License Compliance Audit (SE2 Baseline)"
+echo " Started : $(date)"
+echo "========================================================"
+
+export ORACLE_SID=${ORACLE_SID:-$(echo $ORACLE_SID)}
+ORACLE_HOME_FROM_TAB=$(grep "^${ORACLE_SID}:" /etc/oratab 2>/dev/null | awk -F: '{print $2}')
+export ORACLE_HOME=${ORACLE_HOME_FROM_TAB:-${ORACLE_HOME:-""}}
+export PATH=$ORACLE_HOME/bin:$PATH
+
+DATE=$(date "+%d-%b-%Y %H:%M:%S")
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+
+run_sql() {
+sqlplus -s "/ as sysdba" <<EOF
+set pagesize 500
+set linesize 300
+set feedback off
+set heading on
+set trimspool on
+set wrap off
+ $1
+exit;
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# 1. PARTITIONING (Extra Cost Option)
+# ------------------------------------------------------------------------------
+echo "[1] Checking for Partitioning (Excluding Oracle internal schemas)..."
+PARTITIONING=$(run_sql "
+SELECT owner, table_name, partitioning_type
+FROM dba_part_tables
+WHERE owner NOT IN ('SYS','SYSTEM','AUDSYS','OUTLN','XDB','APEX_040000','MDSYS','WMSYS','OLAPSYS')
+AND owner NOT IN (SELECT username FROM dba_users WHERE oracle_maintained = 'Y')
+ORDER BY owner, table_name;
+")
+
+if [ -z "$PARTITIONING" ]; then
+    PART_STATUS="SAFE: No application partitioning detected."
+    PART_CLASS="safe-box"
+else
+    PART_STATUS="WARNING: Application partitioning detected. Requires Partitioning Option license."
+    PART_CLASS="danger-box"
+fi
+
+# ------------------------------------------------------------------------------
+# 2. ADVANCED SECURITY (TDE, DV, Label Security)
+# ------------------------------------------------------------------------------
+echo "[2] Checking for Advanced Security Options..."
+TDE_CHECK=$(run_sql "
+SELECT tablespace_name, encrypted FROM dba_tablespaces WHERE encrypted = 'YES';
+")
+DV_CHECK=$(run_sql "
+SELECT count(*) FROM dba_dv_status;
+" 2>/dev/null | xargs)
+OLS_CHECK=$(run_sql "
+SELECT count(*) FROM dba_ols_polices;
+" 2>/dev/null | xargs)
+
+ADV_SECURITY_OUTPUT=""
+ADV_CLASS="safe-box"
+if [ -n "$TDE_CHECK" ]; then
+    ADV_SECURITY_OUTPUT+="WARNING: TDE (Tablespace Encryption) is in use.\n"
+    ADV_CLASS="danger-box"
+fi
+if [ "$DV_CHECK" -gt 0 ] 2>/dev/null; then
+    ADV_SECURITY_OUTPUT+="WARNING: Database Vault is configured.\n"
+    ADV_CLASS="danger-box"
+fi
+if [ "$OLS_CHECK" -gt 0 ] 2>/dev/null; then
+    ADV_SECURITY_OUTPUT+="WARNING: Oracle Label Security is in use.\n"
+    ADV_CLASS="danger-box"
+fi
+if [ -z "$ADV_SECURITY_OUTPUT" ]; then
+    ADV_SECURITY_OUTPUT="SAFE: No Advanced Security options detected."
+fi
+
+# ------------------------------------------------------------------------------
+# 3. DIAGNOSTIC & TUNING PACKS (AWR, ASH, ADDM)
+# ------------------------------------------------------------------------------
+echo "[3] Checking for Diagnostic & Tuning Pack Usage..."
+# Note: Control_management_pack_access dictates this, but AWR retention > 7 days is heavily scrutinized
+PACK_ACCESS=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+SELECT value FROM v\$parameter2 WHERE name = 'control_management_pack_access';
+exit;
+EOF
+)
+
+AWR_RETENTION=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+SELECT retention/60/24 FROM dba_hist_wr_control;
+exit;
+EOF
+)
+
+PACK_OUTPUT=""
+PACK_CLASS="safe-box"
+
+if [[ "$PACK_ACCESS" == *"DIAGNOSTIC"* ]] || [[ "$PACK_ACCESS" == *"TUNING"* ]]; then
+    PACK_OUTPUT="CRITICAL: control_management_pack_access is set to: $PACK_ACCESS\n"
+    PACK_CLASS="danger-box"
+fi
+
+if [ -n "$AWR_RETENTION" ]; then
+    # If AWR retention is greater than 8 days (allowing for slight delays), it implies pack usage
+    if awk "BEGIN {exit !($AWR_RETENTION > 8)}"; then
+        PACK_OUTPUT+="WARNING: AWR Retention is set to $AWR_RETENTION days. (Standard is usually 8. High retention implies EE Pack usage).\n"
+        PACK_CLASS="danger-box"
+    else
+        PACK_OUTPUT+="SAFE: AWR Retention is $AWR_RETENTION days.\n"
+    fi
+fi
+
+if [ -z "$PACK_OUTPUT" ]; then
+    PACK_OUTPUT="SAFE: No Diagnostic/Tuning pack usage detected."
+fi
+
+# ------------------------------------------------------------------------------
+# 4. RAC / MULTITHREADED (EE Only Features)
+# ------------------------------------------------------------------------------
+echo "[4] Checking for RAC and Multithreading..."
+THREADS=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+SELECT value FROM v\$parameter2 WHERE name = 'thread';
+exit;
+EOF
+)
+CPU_COUNT=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+SELECT value FROM v\$parameter2 WHERE name = 'cpu_count';
+exit;
+EOF
+)
+# SE2 is limited to 1 socket, but thread checking is a good indicator of EE params
+
+# ------------------------------------------------------------------------------
+# 5. MATERIALIZED VIEWS (Often confused, usually free in SE, but good to track)
+# ------------------------------------------------------------------------------
+echo "[5] Checking Materialized Views..."
+MVS=$(run_sql "
+SELECT owner, count(*) as mv_count
+FROM dba_mviews
+WHERE owner NOT IN ('SYS','SYSTEM','XDB','OUTLN','MDSYS')
+AND owner NOT IN (SELECT username FROM dba_users WHERE oracle_maintained = 'Y')
+GROUP BY owner
+ORDER BY 2 DESC;
+")
+
+# ------------------------------------------------------------------------------
+# 6. RESULT CACHE (EE Feature, sometimes accidentally left on)
+# ------------------------------------------------------------------------------
+echo "[6] Checking Result Cache..."
+RES_CACHE=$(sqlplus -s "/ as sysdba" <<EOF | xargs
+set pagesize 0 feedback off heading off
+SELECT value FROM v\$parameter2 WHERE name = 'result_cache_max_size';
+exit;
+EOF
+)
+if [ -n "$RES_CACHE" ] && [[ "$RES_CACHE" != "0" ]] && [[ "$RES_CACHE" != "0M" ]]; then
+    RES_STATUS="WARNING: Result Cache is enabled and sized at $RES_CACHE. (EE Feature)"
+    RES_CLASS="danger-box"
+else
+    RES_STATUS="SAFE: Result Cache is disabled (Sized 0)."
+    RES_CLASS="safe-box"
+fi
+
+# ------------------------------------------------------------------------------
+# HTML REPORT GENERATION
+# ------------------------------------------------------------------------------
+echo "Generating HTML Report..."
+
+cat > "$REPORT" <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Oracle License Compliance Report</title>
+    <style>
+        body { font-family: Segoe UI, Tahoma, sans-serif; background: #fff3e0; margin: 20px; color: #333; }
+        h1 { color: #e65100; border-bottom: 3px solid #e65100; padding-bottom: 10px; }
+        h2 { background: #ef6c00; color: white; padding: 12px; margin-top: 30px; border-radius: 4px 4px 0 0; }
+        .section { background: white; padding: 0; margin-bottom: 25px; border-radius: 5px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); overflow: hidden; }
+        .section-content { padding: 20px; }
+        pre { background: #fff8e1; padding: 15px; overflow-x: auto; border: 1px solid #ffe0b2; border-radius: 4px; font-size: 13px; }
+        .safe-box { background: #e8f5e9; border-left: 5px solid #28a745; padding: 15px; font-weight: bold; color: #2e7d32; white-space: pre-wrap; }
+        .danger-box { background: #ffebee; border-left: 5px solid #dc3545; padding: 15px; font-weight: bold; color: #c62828; white-space: pre-wrap; }
+        .disclaimer { background: #ffcdd2; color: #b71c1c; padding: 15px; border-radius: 5px; font-weight: bold; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+
+<h1>⚠️ Oracle Standard Edition License Compliance</h1>
+
+<div class="disclaimer">
+    DISCLAIMER: This script checks database parameters and objects against known Enterprise Edition features.
+    This does NOT constitute official legal or licensing advice. Only an Oracle LMS (License Management Services) script is legally binding.
+    Use this to identify and fix accidental usage BEFORE an official Oracle audit.
+</div>
+
+<div class="section">
+    <h2>1. Partitioning Option</h2>
+    <div class="section-content">
+        <div class="$PART_CLASS">$PART_STATUS</div>
+        <pre>$PARTITIONING</pre>
+    </div>
+</div>
+
+<div class="section">
+    <h2>2. Advanced Security Options (TDE, Vault, Label Security)</h2>
+    <div class="section-content">
+        <div class="$ADV_CLASS">$ADV_SECURITY_OUTPUT</div>
+        <pre>$TDE_CHECK</pre>
+    </div>
+</div>
+
+<div class="section">
+    <h2>3. Diagnostic & Tuning Packs (AWR / ASH / ADDM)</h2>
+    <div class="section-content">
+        <div class="$PACK_CLASS">$PACK_OUTPUT</div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>4. Result Cache (EE Feature)</h2>
+    <div class="section-content">
+        <div class="$RES_CLASS">$RES_STATUS</div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>5. Application Materialized Views</h2>
+    <div class="section-content">
+        <p><em>Note: Basic Materialized Views are generally included in SE2, but complex ones (Refresh on Commit) require EE. Review the list below.</em></p>
+        <pre>$MVS</pre>
+    </div>
+</div>
+
+<div class="section">
+    <h2>System Context</h2>
+    <div class="section-content">
+        <pre>
+Host: $HOSTNAME
+CPU Count Param: $CPU_COUNT
+Thread Param: $THREADS
+        </pre>
+    </div>
+</div>
+
+</body>
+</html>
+EOF
+
+echo ""
+echo "========================================================"
+echo " License Audit Completed"
+echo "========================================================"
+echo "HTML Report : $REPORT"
+echo "To view: firefox $REPORT &"
+echo "========================================================"
